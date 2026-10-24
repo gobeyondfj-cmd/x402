@@ -3,7 +3,7 @@ import { x402Client } from "../../../src/client/x402Client";
 import { PaymentPolicy, QuoteMismatchError } from "../../../src/client/x402Client";
 import { MockSchemeNetworkClient } from "../../mocks";
 import { buildPaymentPayload, buildPaymentRequired, buildPaymentRequirements } from "../../mocks";
-import { Network, PaymentRequirements } from "../../../src/types";
+import { Network, PaymentRequired, PaymentRequirements } from "../../../src/types";
 
 describe("x402Client", () => {
   describe("Construction", () => {
@@ -2155,6 +2155,98 @@ describe("x402Client", () => {
         }),
       );
       expect(mockClient.createPaymentPayloadCalls).toHaveLength(2);
+    });
+
+    it('"first-accepted": a rejected quote never replaces the accepted anchor', async () => {
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "first-accepted",
+      });
+
+      await client.createPaymentPayload(offered("10000")); // anchors the quote
+      const err = await client.createPaymentPayload(offered("100000")).catch(e => e);
+      expect(err).toBeInstanceOf(QuoteMismatchError);
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
+
+      // anchor intact: the accepted amount still pays after the rejection
+      await client.createPaymentPayload(offered("10000"));
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(2);
+
+      // and the rejected amount is still rejected — the ledger was not overwritten
+      const err2 = await client.createPaymentPayload(offered("100000")).catch(e => e);
+      expect(err2).toBeInstanceOf(QuoteMismatchError);
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(2);
+    });
+
+    it('"first-accepted": payTo, asset and resource url each anchor independently', async () => {
+      const altAsset = "0x" + "8".repeat(40);
+      const mockClient = new MockSchemeNetworkClient("exact");
+      mockClient.setFindDefaultAsset((asset, _network) =>
+        asset.toLowerCase() === usdc.asset.toLowerCase()
+          ? usdc
+          : asset.toLowerCase() === altAsset.toLowerCase()
+            ? { asset: altAsset, decimals: 6, symbol: "ALT" }
+            : undefined,
+      );
+      const client = new x402Client();
+      client.register(network, mockClient);
+      client.setSpendControls({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "first-accepted",
+      });
+
+      await client.createPaymentPayload(offered("10000")); // anchors the base quote key
+
+      // each variant changes exactly one quote-key field, keeping the same 5x
+      // amount that would be rejected against the base anchor
+      const variants: [string, PaymentRequired][] = [
+        [
+          "payTo",
+          buildPaymentRequired({
+            accepts: [
+              buildPaymentRequirements({
+                scheme: "exact",
+                network,
+                asset: usdc.asset,
+                payTo: "0x" + "9".repeat(40),
+                amount: "50000",
+              }),
+            ],
+          }),
+        ],
+        [
+          "asset",
+          buildPaymentRequired({
+            accepts: [
+              buildPaymentRequirements({
+                scheme: "exact",
+                network,
+                asset: altAsset,
+                amount: "50000",
+              }),
+            ],
+          }),
+        ],
+        [
+          "resource url",
+          buildPaymentRequired({
+            resource: { url: "https://other.example.com/api" },
+            accepts: [
+              buildPaymentRequirements({
+                scheme: "exact",
+                network,
+                asset: usdc.asset,
+                amount: "50000",
+              }),
+            ],
+          }),
+        ],
+      ];
+      for (const [, req] of variants) {
+        // a different quote key has no anchor yet: allowed, then anchored
+        await client.createPaymentPayload(req);
+      }
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(4);
     });
 
     it("tolerance: 1.5x allows a modest reprice but not a 2x hike", async () => {
