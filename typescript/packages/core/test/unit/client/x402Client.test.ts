@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { x402Client } from "../../../src/client/x402Client";
-import { PaymentPolicy } from "../../../src/client/x402Client";
+import { PaymentPolicy, QuoteMismatchError } from "../../../src/client/x402Client";
 import { MockSchemeNetworkClient } from "../../mocks";
 import { buildPaymentPayload, buildPaymentRequired, buildPaymentRequirements } from "../../mocks";
 import { Network, PaymentRequirements } from "../../../src/types";
@@ -2040,6 +2040,171 @@ describe("x402Client", () => {
         }),
       );
       expect(mockClient.createPaymentPayloadCalls[0].context?.maxAmountPerPayment).toBe("500000");
+    });
+  });
+
+  describe("spendControls.expectedAmount", () => {
+    const network = "eip155:8453" as Network;
+    const usdc = {
+      asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      decimals: 6,
+      symbol: "USDC",
+    };
+
+    function clientWithExpectation(controls: Parameters<x402Client["setSpendControls"]>[0]) {
+      const mockClient = new MockSchemeNetworkClient("exact");
+      mockClient.setFindDefaultAsset((asset, _network) =>
+        asset.toLowerCase() === usdc.asset.toLowerCase() ? usdc : undefined,
+      );
+      const client = new x402Client();
+      client.register(network, mockClient);
+      if (controls !== undefined) {
+        client.setSpendControls(controls);
+      }
+      return { client, mockClient };
+    }
+
+    function offered(amount: string) {
+      return buildPaymentRequired({
+        accepts: [
+          buildPaymentRequirements({
+            scheme: "exact",
+            network,
+            asset: usdc.asset,
+            amount,
+          }),
+        ],
+      });
+    }
+
+    it("explicit expectation: unchanged quote pays (10000 -> 10000)", async () => {
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "$0.01",
+      });
+
+      await client.createPaymentPayload(offered("10000"));
+      await client.createPaymentPayload(offered("10000"));
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(2);
+    });
+
+    it("explicit expectation: a 10x hike is rejected pre-signer with QuoteMismatchError", async () => {
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "$0.01",
+      });
+
+      await client.createPaymentPayload(offered("10000"));
+      const err = await client.createPaymentPayload(offered("100000")).catch(e => e);
+      expect(err).toBeInstanceOf(QuoteMismatchError);
+      expect(err.source).toBe("caller-config");
+      expect(err.expected).toBe("10000");
+      expect(err.offered).toBe("100000");
+      expect(err.message).toMatch(/quote_mismatch_vs_expected: amount 10000 -> 100000/);
+      // rejected before the scheme client (signer) was called a second time
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
+    });
+
+    it("explicit expectation: first-acceptance mismatch below the USD cap is still rejected", async () => {
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1", // the cap alone would pass $0.05
+        expectedAmount: "$0.01",
+      });
+
+      const err = await client.createPaymentPayload(offered("50000")).catch(e => e);
+      expect(err).toBeInstanceOf(QuoteMismatchError);
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(0);
+    });
+
+    it('"first-accepted": first offer anchors, unchanged pays, later hike rejected', async () => {
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "first-accepted",
+      });
+
+      await client.createPaymentPayload(offered("10000")); // anchors the quote
+      await client.createPaymentPayload(offered("10000")); // unchanged: pays
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(2);
+
+      const err = await client.createPaymentPayload(offered("100000")).catch(e => e);
+      expect(err).toBeInstanceOf(QuoteMismatchError);
+      expect(err.source).toBe("quote-ledger");
+      expect(err.message).toMatch(/quote_mismatch_vs_accepted: amount 10000 -> 100000/);
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(2);
+    });
+
+    it('"first-accepted": different quote keys anchor independently', async () => {
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "first-accepted",
+      });
+
+      await client.createPaymentPayload(offered("10000")); // anchors resource A
+      // same amounts but a different resource url => a different quote key
+      await client.createPaymentPayload(
+        buildPaymentRequired({
+          resource: { url: "https://other.example.com/api" },
+          accepts: [
+            buildPaymentRequirements({
+              scheme: "exact",
+              network,
+              asset: usdc.asset,
+              amount: "50000",
+            }),
+          ],
+        }),
+      );
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(2);
+    });
+
+    it("tolerance: 1.5x allows a modest reprice but not a 2x hike", async () => {
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "$0.01",
+        expectedAmountTolerance: 1.5,
+      });
+
+      await client.createPaymentPayload(offered("12000")); // $0.012 within 1.5x
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
+
+      const err = await client.createPaymentPayload(offered("20000")).catch(e => e);
+      expect(err).toBeInstanceOf(QuoteMismatchError);
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
+    });
+
+    it("tolerance rejects a price drop beyond the band too", async () => {
+      const { client } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "$0.10",
+        expectedAmountTolerance: 2,
+      });
+
+      // $0.10 / 2 = $0.05 floor; $0.01 is below the band
+      const err = await client.createPaymentPayload(offered("10000")).catch(e => e);
+      expect(err).toBeInstanceOf(QuoteMismatchError);
+    });
+
+    it("expectedAmount: false keeps current behavior (everything under the cap signs)", async () => {
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: false,
+      });
+
+      await client.createPaymentPayload(offered("10000"));
+      await client.createPaymentPayload(offered("100000")); // 10x hike still signs, as before
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(2);
+    });
+
+    it("rejects an invalid tolerance below 1.0", async () => {
+      const { client } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "$0.01",
+        expectedAmountTolerance: 0.5,
+      });
+
+      await expect(client.createPaymentPayload(offered("10000"))).rejects.toThrow(
+        /expectedAmountTolerance must be >= 1.0/,
+      );
     });
   });
 });
