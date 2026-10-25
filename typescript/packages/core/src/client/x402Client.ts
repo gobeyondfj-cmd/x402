@@ -214,6 +214,14 @@ export interface SpendControls {
    * @default 1.0
    */
   expectedAmountTolerance?: number;
+  /**
+   * Caller's expected recipient, enforced pre-signature whenever set (both
+   * expectedAmount modes and standalone). Establishes that the recipient was
+   * caller-approved — complementing the recipient ledger, which only detects
+   * substitution against the first committed payTo. A mismatch is rejected
+   * with {@link QuoteMismatchError} (`field: "payTo"`, `source: "caller-config"`).
+   */
+  expectedPayTo?: string;
 }
 
 /**
@@ -273,6 +281,41 @@ export class QuoteMismatchError extends Error {
     this.offered = args.offered;
     this.source = args.source;
     this.field = args.field ?? "amount";
+  }
+}
+
+/**
+ * Thrown when an expectation control is enabled but an offer cannot be
+ * evaluated against it at all (non-atomic decimal-ledger amount, or an
+ * explicit Money expectation against an asset with unknown decimals).
+ * Fail-closed: silently skipping the check would sign an unchecked payment.
+ */
+export class QuoteExpectationUnsupportedError extends Error {
+  /** Quote key tuple (resource url, scheme, network, asset, payTo). */
+  readonly quoteKey: string;
+  /** Why the expectation cannot be evaluated. */
+  readonly reason: "non-atomic-amount" | "unknown-asset-decimals";
+
+  /**
+   * Creates a QuoteExpectationUnsupportedError.
+   *
+   * @param args - Rejection details
+   * @param args.quoteKey - Quote key tuple
+   * @param args.reason - Why the expectation cannot be evaluated
+   */
+  constructor(args: {
+    quoteKey: string;
+    reason: "non-atomic-amount" | "unknown-asset-decimals";
+  }) {
+    super(
+      `quote-check-unsupported: ${args.reason}. The offered requirement cannot be evaluated ` +
+        `against spendControls.expectedAmount (${args.reason === "non-atomic-amount" ? "the amount is not an integer atomic string, e.g. a decimal-ledger asset" : "the asset has no known default-asset decimals for Money conversion"}). ` +
+        `Rejected fail-closed: an asset allowlist entry or a higher spend cap is not a ` +
+        `substitute for an unchecked expectation. Set expectedAmount: false to disable.`,
+    );
+    this.name = "QuoteExpectationUnsupportedError";
+    this.quoteKey = args.quoteKey;
+    this.reason = args.reason;
   }
 }
 
@@ -420,6 +463,8 @@ export class x402Client {
    * rejected pre-signature (the A5 flank from #3866).
    */
   private readonly recipientLedger: Map<string, string> = new Map();
+  /** Serialization chain for createPaymentPayload (anchor check+record atomicity). */
+  private payloadChain: Promise<unknown> = Promise.resolve();
 
   private beforePaymentCreationHooks: BeforePaymentCreationHook[] = [];
   private afterPaymentCreationHooks: AfterPaymentCreationHook[] = [];
@@ -627,6 +672,25 @@ export class x402Client {
    * @returns Promise resolving to the complete payment payload
    */
   async createPaymentPayload(
+    paymentRequired: PaymentRequired,
+  ): Promise<PaymentPayload> {
+    // Serialize payload creation: expectation and recipient anchors are checked
+    // synchronously but recorded after the async scheme call, so two concurrent
+    // first calls on a fresh client could both pass an empty-ledger check.
+    // Chaining makes check+anchor atomic per client.
+    const run = this.payloadChain.then(() => this.createPaymentPayloadInner(paymentRequired));
+    this.payloadChain = run.catch(() => undefined);
+    return run;
+  }
+
+  /**
+   * Inner payload creation, always entered via {@link createPaymentPayload}'s
+   * serialization chain.
+   *
+   * @param paymentRequired - The PaymentRequired response from the server
+   * @returns Promise resolving to the complete payment payload
+   */
+  private async createPaymentPayloadInner(
     paymentRequired: PaymentRequired,
   ): Promise<PaymentPayload> {
     const clientSchemesByNetwork = this.registeredClientSchemes.get(paymentRequired.x402Version);
@@ -1096,12 +1160,12 @@ export class x402Client {
     resourceUrl?: string,
   ): PaymentRequirements[] {
     const controls = this.spendControls;
-    if (controls === false || !controls.expectedAmount) {
+    if (controls === false || (!controls.expectedAmount && !controls.expectedPayTo)) {
       return requirements;
     }
 
     const tolerance = controls.expectedAmountTolerance ?? 1.0;
-    if (!(tolerance >= 1.0)) {
+    if (controls.expectedAmount && !(tolerance >= 1.0)) {
       throw new Error(
         `spendControls.expectedAmountTolerance must be >= 1.0 (a multiplier on the expectation); got ${tolerance}`,
       );
@@ -1120,10 +1184,29 @@ export class x402Client {
       source: QuoteExpectationSource;
       field: "amount" | "payTo";
     }> = [];
+    const unsupported: Array<{
+      requirement: PaymentRequirements;
+      reason: "non-atomic-amount" | "unknown-asset-decimals";
+    }> = [];
 
     const filtered = requirements.filter(requirement => {
-      // Recipient binding (both modes): the first payTo committed for this
-      // (resource, scheme, network, asset) tuple sticks; a substituted
+      // Explicit recipient expectation (whenever configured): the recipient
+      // must be caller-approved, not merely consistent with history.
+      if (
+        controls.expectedPayTo !== undefined &&
+        requirement.payTo !== controls.expectedPayTo
+      ) {
+        mismatches.push({
+          requirement,
+          expected: controls.expectedPayTo,
+          source: "caller-config",
+          field: "payTo",
+        });
+        return false;
+      }
+
+      // Recipient binding (expectedAmount modes): the first payTo committed for
+      // this (resource, scheme, network, asset) tuple sticks; a substituted
       // recipient on a known quote is a mismatch, regardless of amount.
       const boundPayTo = this.recipientLedger.get(
         this.recipientKeyFor(resourceUrl, requirement),
@@ -1140,9 +1223,11 @@ export class x402Client {
 
       const rawAmount = rawAmountOf(requirement);
       if (!isAtomicAmount(rawAmount)) {
-        // Decimal-ledger amounts (e.g. XRPL IOUs): the expectation check only
-        // supports integer atomic amounts; other controls still apply.
-        return true;
+        // Decimal-ledger amounts (e.g. XRPL IOUs) cannot be compared against
+        // the expectation. Fail-closed: skipping the check would sign an
+        // unchecked payment; an allowlist entry or higher cap is no substitute.
+        unsupported.push({ requirement, reason: "non-atomic-amount" });
+        return false;
       }
 
       let expectedAtomic: string | undefined;
@@ -1155,18 +1240,22 @@ export class x402Client {
           // successful payload creation (see anchorQuoteExpectation).
           return true;
         }
-      } else {
+      } else if (controls.expectedAmount) {
         source = "caller-config";
         const defaultAsset = defaultAssetFor(requirement);
         if (!defaultAsset) {
-          // Unknown decimals for a non-default asset: cannot convert the Money
-          // expectation; leave enforcement to the other controls.
-          return true;
+          // Unknown decimals for a non-default asset: the Money expectation
+          // cannot be converted. Fail-closed rather than skipping the check.
+          unsupported.push({ requirement, reason: "unknown-asset-decimals" });
+          return false;
         }
         expectedAtomic = convertToTokenAmount(
           parseMoney(controls.expectedAmount as Money).amount,
           defaultAsset.decimals,
         );
+      } else {
+        // Only expectedPayTo is set: the recipient check above already ran.
+        return true;
       }
 
       const offered = BigInt(rawAmount);
@@ -1189,6 +1278,13 @@ export class x402Client {
           first.field === "payTo" ? first.requirement.payTo : rawAmountOf(first.requirement),
         source: first.source,
         field: first.field,
+      });
+    }
+    if (filtered.length === 0 && unsupported.length > 0) {
+      const first = unsupported[0];
+      throw new QuoteExpectationUnsupportedError({
+        quoteKey: this.quoteKeyFor(resourceUrl, first.requirement),
+        reason: first.reason,
       });
     }
     return filtered;

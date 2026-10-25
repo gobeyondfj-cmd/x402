@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { x402Client } from "../../../src/client/x402Client";
-import { PaymentPolicy, QuoteMismatchError } from "../../../src/client/x402Client";
+import {
+  PaymentPolicy,
+  QuoteMismatchError,
+  QuoteExpectationUnsupportedError,
+} from "../../../src/client/x402Client";
 import { MockSchemeNetworkClient } from "../../mocks";
 import { buildPaymentPayload, buildPaymentRequired, buildPaymentRequirements } from "../../mocks";
 import { Network, PaymentRequired, PaymentRequirements } from "../../../src/types";
@@ -2386,6 +2390,189 @@ describe("x402Client", () => {
       await expect(client.createPaymentPayload(offered("10000"))).rejects.toThrow(
         /expectedAmountTolerance must be >= 1.0/,
       );
+    });
+
+    // ── Round-3 reviewer gaps (concurrency + unsupported expectations) ──
+
+    function deferScheme(mockClient: MockSchemeNetworkClient) {
+      const orig = mockClient.createPaymentPayload.bind(mockClient);
+      let release!: () => void;
+      const gate = new Promise<void>(r => (release = r));
+      mockClient.createPaymentPayload = async (
+        ...args: Parameters<MockSchemeNetworkClient["createPaymentPayload"]>
+      ) => {
+        await gate;
+        return orig(...args);
+      };
+      return { release };
+    }
+
+    it("concurrent first calls, explicit mode, different recipients: only one reaches the signer", async () => {
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "$0.01",
+      });
+      const { release } = deferScheme(mockClient);
+
+      const p1 = client.createPaymentPayload(offered("10000"));
+      const p2 = client.createPaymentPayload(
+        buildPaymentRequired({
+          accepts: [
+            buildPaymentRequirements({
+              scheme: "exact",
+              network,
+              asset: usdc.asset,
+              payTo: "0x" + "2".repeat(40),
+              amount: "10000",
+            }),
+          ],
+        }),
+      );
+      release();
+      const results = await Promise.allSettled([p1, p2]);
+
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
+      const rejected = results.filter(r => r.status === "rejected");
+      expect(rejected).toHaveLength(1);
+      expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(QuoteMismatchError);
+      expect((rejected[0] as PromiseRejectedResult).reason.field).toBe("payTo");
+    });
+
+    it("concurrent first calls, first-accepted, different amounts: only one anchors", async () => {
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "first-accepted",
+      });
+      const { release } = deferScheme(mockClient);
+
+      const p1 = client.createPaymentPayload(offered("10000"));
+      const p2 = client.createPaymentPayload(offered("50000"));
+      release();
+      const results = await Promise.allSettled([p1, p2]);
+
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
+      const rejected = results.filter(r => r.status === "rejected");
+      expect(rejected).toHaveLength(1);
+      expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(QuoteMismatchError);
+    });
+
+    it("unsupported: decimal-ledger amount is rejected fail-closed; valid atomic offer still pays", async () => {
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "$0.01",
+      });
+
+      const err = await client
+        .createPaymentPayload(
+          buildPaymentRequired({
+            accepts: [
+              buildPaymentRequirements({
+                scheme: "exact",
+                network,
+                asset: usdc.asset,
+                amount: "0.01", // decimal-ledger shape, not atomic
+              }),
+            ],
+          }),
+        )
+        .catch(e => e);
+      expect(err).toBeInstanceOf(QuoteExpectationUnsupportedError);
+      expect(err.reason).toBe("non-atomic-amount");
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(0);
+
+      // a matching valid offer is preserved
+      await client.createPaymentPayload(offered("10000"));
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
+    });
+
+    it("unsupported: explicit expectation against an allowlisted asset with unknown decimals is rejected fail-closed", async () => {
+      const altAsset = "0x" + "8".repeat(40);
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "$0.01",
+        allowedAssets: [{ network, asset: altAsset }],
+      });
+
+      const err = await client
+        .createPaymentPayload(
+          buildPaymentRequired({
+            accepts: [
+              buildPaymentRequirements({
+                scheme: "exact",
+                network,
+                asset: altAsset,
+                amount: "10000",
+              }),
+            ],
+          }),
+        )
+        .catch(e => e);
+      expect(err).toBeInstanceOf(QuoteExpectationUnsupportedError);
+      expect(err.reason).toBe("unknown-asset-decimals");
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(0);
+
+      // the default-asset offer is unaffected
+      await client.createPaymentPayload(offered("10000"));
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
+    });
+
+    it("expectedPayTo: wrong recipient rejected even at the expected amount (caller-config)", async () => {
+      const approved = "0x" + "7".repeat(40);
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "$0.01",
+        expectedPayTo: approved,
+      });
+
+      const err = await client.createPaymentPayload(offered("10000")).catch(e => e); // payTo = test_recipient
+      expect(err).toBeInstanceOf(QuoteMismatchError);
+      expect(err.field).toBe("payTo");
+      expect(err.source).toBe("caller-config");
+      expect(err.expected).toBe(approved);
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(0);
+
+      await client.createPaymentPayload(
+        buildPaymentRequired({
+          accepts: [
+            buildPaymentRequirements({
+              scheme: "exact",
+              network,
+              asset: usdc.asset,
+              payTo: approved,
+              amount: "10000",
+            }),
+          ],
+        }),
+      );
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
+    });
+
+    it("expectedPayTo standalone (no expectedAmount) still binds the recipient", async () => {
+      const approved = "0x" + "7".repeat(40);
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedPayTo: approved,
+      });
+
+      const err = await client.createPaymentPayload(offered("10000")).catch(e => e);
+      expect(err).toBeInstanceOf(QuoteMismatchError);
+      expect(err.field).toBe("payTo");
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(0);
+
+      await client.createPaymentPayload(
+        buildPaymentRequired({
+          accepts: [
+            buildPaymentRequirements({
+              scheme: "exact",
+              network,
+              asset: usdc.asset,
+              payTo: approved,
+              amount: "10000",
+            }),
+          ],
+        }),
+      );
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
     });
   });
 });
