@@ -2574,5 +2574,56 @@ describe("x402Client", () => {
       );
       expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
     });
+
+    it("expectedPayTo standalone: decimal-ledger amount passes with a matching recipient, fails with a different one (expectedAmount unset and false)", async () => {
+      const approved = "0x" + "7".repeat(40);
+      const substituted = "0x" + "9".repeat(40);
+      for (const expectedAmount of [undefined, false] as const) {
+        const { client, mockClient } = clientWithExpectation({
+          maxAmountPerPayment: "$1",
+          expectedAmount,
+          expectedPayTo: approved,
+        });
+
+        // Matching recipient with a decimal-ledger amount: no amount
+        // expectation is enabled, so the representation must not matter
+        // (round-4 review regression: this threw QuoteExpectationUnsupportedError).
+        await client.createPaymentPayload(
+          buildPaymentRequired({
+            accepts: [
+              buildPaymentRequirements({
+                scheme: "exact",
+                network,
+                asset: usdc.asset,
+                payTo: approved,
+                amount: "0.50", // decimal-ledger shape, not atomic
+              }),
+            ],
+          }),
+        );
+        expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
+
+        // A different recipient is still rejected, decimal amount or not.
+        const err = await client
+          .createPaymentPayload(
+            buildPaymentRequired({
+              accepts: [
+                buildPaymentRequirements({
+                  scheme: "exact",
+                  network,
+                  asset: usdc.asset,
+                  payTo: substituted,
+                  amount: "0.50",
+                }),
+              ],
+            }),
+          )
+          .catch(e => e);
+        expect(err).toBeInstanceOf(QuoteMismatchError);
+        expect(err.field).toBe("payTo");
+        expect(err.source).toBe("caller-config");
+        expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
+      }
+    });
   });
 });

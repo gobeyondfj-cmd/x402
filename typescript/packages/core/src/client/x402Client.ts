@@ -1222,17 +1222,17 @@ export class x402Client {
       }
 
       const rawAmount = rawAmountOf(requirement);
-      if (!isAtomicAmount(rawAmount)) {
-        // Decimal-ledger amounts (e.g. XRPL IOUs) cannot be compared against
-        // the expectation. Fail-closed: skipping the check would sign an
-        // unchecked payment; an allowlist entry or higher cap is no substitute.
-        unsupported.push({ requirement, reason: "non-atomic-amount" });
-        return false;
-      }
 
       let expectedAtomic: string | undefined;
       let source: QuoteExpectationSource;
       if (controls.expectedAmount === "first-accepted") {
+        if (!isAtomicAmount(rawAmount)) {
+          // Decimal-ledger amounts (e.g. XRPL IOUs) cannot be compared against
+          // the expectation. Fail-closed: skipping the check would sign an
+          // unchecked payment; an allowlist entry or higher cap is no substitute.
+          unsupported.push({ requirement, reason: "non-atomic-amount" });
+          return false;
+        }
         source = "quote-ledger";
         expectedAtomic = this.quoteLedger.get(this.quoteKeyFor(resourceUrl, requirement))?.atomic;
         if (expectedAtomic === undefined) {
@@ -1241,6 +1241,11 @@ export class x402Client {
           return true;
         }
       } else if (controls.expectedAmount) {
+        if (!isAtomicAmount(rawAmount)) {
+          // Same fail-closed rule as above, for the explicit-expectation mode.
+          unsupported.push({ requirement, reason: "non-atomic-amount" });
+          return false;
+        }
         source = "caller-config";
         const defaultAsset = defaultAssetFor(requirement);
         if (!defaultAsset) {
@@ -1255,6 +1260,8 @@ export class x402Client {
         );
       } else {
         // Only expectedPayTo is set: the recipient check above already ran.
+        // Amount representation is irrelevant here — there is no amount
+        // expectation to evaluate, so a decimal-ledger amount must pass.
         return true;
       }
 
