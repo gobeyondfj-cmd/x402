@@ -330,6 +330,24 @@ function isAtomicAmount(amount: string): boolean {
 }
 
 /**
+ * Recipient comparison for expectation checks. Exact match by default;
+ * EVM hex addresses compare case-insensitively (checksummed and lowercase
+ * forms name the same account). Case-sensitive formats (e.g. base58) are
+ * untouched.
+ *
+ * @param a - First recipient address
+ * @param b - Second recipient address
+ * @returns True when both addresses name the same recipient
+ */
+function sameRecipient(a: string, b: string): boolean {
+  if (a === b) {
+    return true;
+  }
+  const evmHex = /^0x[0-9a-fA-F]{40}$/;
+  return evmHex.test(a) && evmHex.test(b) && a.toLowerCase() === b.toLowerCase();
+}
+
+/**
  * Finds the matching `allowedAssets` entry for a requirement.
  *
  * @param controls - Active spend controls
@@ -1194,7 +1212,7 @@ export class x402Client {
       // must be caller-approved, not merely consistent with history.
       if (
         controls.expectedPayTo !== undefined &&
-        requirement.payTo !== controls.expectedPayTo
+        !sameRecipient(requirement.payTo, controls.expectedPayTo)
       ) {
         mismatches.push({
           requirement,
@@ -1211,7 +1229,7 @@ export class x402Client {
       const boundPayTo = this.recipientLedger.get(
         this.recipientKeyFor(resourceUrl, requirement),
       );
-      if (boundPayTo !== undefined && boundPayTo !== requirement.payTo) {
+      if (boundPayTo !== undefined && !sameRecipient(boundPayTo, requirement.payTo)) {
         mismatches.push({
           requirement,
           expected: boundPayTo,

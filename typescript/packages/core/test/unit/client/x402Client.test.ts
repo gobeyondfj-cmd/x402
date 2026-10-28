@@ -2625,5 +2625,86 @@ describe("x402Client", () => {
         expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
       }
     });
+
+    it("expectedPayTo: checksummed and lowercase EVM forms of the same recipient are not a mismatch", async () => {
+      const lowercase = "0x" + "ab".repeat(20);
+      const checksummed = "0x" + "aB".repeat(20);
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedPayTo: checksummed,
+      });
+
+      await client.createPaymentPayload(
+        buildPaymentRequired({
+          accepts: [
+            buildPaymentRequirements({
+              scheme: "exact",
+              network,
+              asset: usdc.asset,
+              payTo: lowercase,
+              amount: "10000",
+            }),
+          ],
+        }),
+      );
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
+    });
+
+    it("recipient ledger: a case-variant EVM payTo is not a substitution (base58-style exact match is untouched)", async () => {
+      const lowercase = "0x" + "ab".repeat(20);
+      const checksummed = "0x" + "aB".repeat(20);
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "first-accepted",
+      });
+
+      // anchor at the lowercase form
+      await client.createPaymentPayload(
+        buildPaymentRequired({
+          accepts: [
+            buildPaymentRequirements({
+              scheme: "exact",
+              network,
+              asset: usdc.asset,
+              payTo: lowercase,
+              amount: "10000",
+            }),
+          ],
+        }),
+      );
+      // the checksummed form of the same account is not a substitution
+      await client.createPaymentPayload(
+        buildPaymentRequired({
+          accepts: [
+            buildPaymentRequirements({
+              scheme: "exact",
+              network,
+              asset: usdc.asset,
+              payTo: checksummed,
+              amount: "10000",
+            }),
+          ],
+        }),
+      );
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(2);
+    });
+
+    it("concurrent identical first calls: both may sign — serialization prevents conflicting commitments, not duplicate valid ones", async () => {
+      const { client, mockClient } = clientWithExpectation({
+        maxAmountPerPayment: "$1",
+        expectedAmount: "first-accepted",
+      });
+      const { release } = deferScheme(mockClient);
+
+      // identical offers (same amount, same payTo): both match the anchor the
+      // first call records, so both are valid payments (A10a/A10b semantics).
+      const p1 = client.createPaymentPayload(offered("10000"));
+      const p2 = client.createPaymentPayload(offered("10000"));
+      release();
+      const results = await Promise.allSettled([p1, p2]);
+
+      expect(results.every(r => r.status === "fulfilled")).toBe(true);
+      expect(mockClient.createPaymentPayloadCalls).toHaveLength(2);
+    });
   });
 });
