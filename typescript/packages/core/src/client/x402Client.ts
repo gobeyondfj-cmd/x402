@@ -330,21 +330,27 @@ function isAtomicAmount(amount: string): boolean {
 }
 
 /**
- * Recipient comparison for expectation checks. Exact match by default;
+ * Canonical recipient representation for comparisons and quote-ledger keys.
  * EVM hex addresses compare case-insensitively (checksummed and lowercase
  * forms name the same account). Case-sensitive formats (e.g. base58) are
  * untouched.
+ *
+ * @param recipient - Recipient address to canonicalize
+ * @returns Canonical recipient representation
+ */
+function canonicalRecipient(recipient: string): string {
+  return /^0x[0-9a-fA-F]{40}$/.test(recipient) ? recipient.toLowerCase() : recipient;
+}
+
+/**
+ * Compare two recipients using their canonical representations.
  *
  * @param a - First recipient address
  * @param b - Second recipient address
  * @returns True when both addresses name the same recipient
  */
 function sameRecipient(a: string, b: string): boolean {
-  if (a === b) {
-    return true;
-  }
-  const evmHex = /^0x[0-9a-fA-F]{40}$/;
-  return evmHex.test(a) && evmHex.test(b) && a.toLowerCase() === b.toLowerCase();
+  return canonicalRecipient(a) === canonicalRecipient(b);
 }
 
 /**
@@ -1329,7 +1335,7 @@ export class x402Client {
       requirement.scheme,
       requirement.network,
       requirement.asset,
-      requirement.payTo,
+      canonicalRecipient(requirement.payTo),
     ]);
   }
 

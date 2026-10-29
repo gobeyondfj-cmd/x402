@@ -2650,44 +2650,81 @@ describe("x402Client", () => {
       expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
     });
 
-    it("recipient ledger: a case-variant EVM payTo is not a substitution (base58-style exact match is untouched)", async () => {
-      const lowercase = "0x" + "ab".repeat(20);
-      const checksummed = "0x" + "aB".repeat(20);
-      const { client, mockClient } = clientWithExpectation({
-        maxAmountPerPayment: "$1",
-        expectedAmount: "first-accepted",
-      });
+    it.each([
+      {
+        name: "unchanged amount without expectedPayTo passes",
+        withExpectedPayTo: false,
+        secondAmount: "10000",
+        shouldPass: true,
+      },
+      {
+        name: "unchanged amount with expectedPayTo passes",
+        withExpectedPayTo: true,
+        secondAmount: "10000",
+        shouldPass: true,
+      },
+      {
+        name: "changed amount without expectedPayTo rejects against the anchor",
+        withExpectedPayTo: false,
+        secondAmount: "100000",
+        shouldPass: false,
+      },
+      {
+        name: "changed amount with expectedPayTo rejects against the anchor",
+        withExpectedPayTo: true,
+        secondAmount: "100000",
+        shouldPass: false,
+      },
+    ])(
+      "recipient ledger after case-only EVM variation: $name",
+      async ({ withExpectedPayTo, secondAmount, shouldPass }) => {
+        const lowercase = "0x" + "ab".repeat(20);
+        const checksummed = "0x" + "aB".repeat(20);
+        const { client, mockClient } = clientWithExpectation({
+          maxAmountPerPayment: "$1",
+          expectedAmount: "first-accepted",
+          expectedPayTo: withExpectedPayTo ? checksummed : undefined,
+        });
 
-      // anchor at the lowercase form
-      await client.createPaymentPayload(
-        buildPaymentRequired({
-          accepts: [
-            buildPaymentRequirements({
-              scheme: "exact",
-              network,
-              asset: usdc.asset,
-              payTo: lowercase,
-              amount: "10000",
-            }),
-          ],
-        }),
-      );
-      // the checksummed form of the same account is not a substitution
-      await client.createPaymentPayload(
-        buildPaymentRequired({
-          accepts: [
-            buildPaymentRequirements({
-              scheme: "exact",
-              network,
-              asset: usdc.asset,
-              payTo: checksummed,
-              amount: "10000",
-            }),
-          ],
-        }),
-      );
-      expect(mockClient.createPaymentPayloadCalls).toHaveLength(2);
-    });
+        await client.createPaymentPayload(
+          buildPaymentRequired({
+            accepts: [
+              buildPaymentRequirements({
+                scheme: "exact",
+                network,
+                asset: usdc.asset,
+                payTo: lowercase,
+                amount: "10000",
+              }),
+            ],
+          }),
+        );
+        const second = client.createPaymentPayload(
+          buildPaymentRequired({
+            accepts: [
+              buildPaymentRequirements({
+                scheme: "exact",
+                network,
+                asset: usdc.asset,
+                payTo: checksummed,
+                amount: secondAmount,
+              }),
+            ],
+          }),
+        );
+
+        if (shouldPass) {
+          await second;
+          expect(mockClient.createPaymentPayloadCalls).toHaveLength(2);
+        } else {
+          const err = await second.catch(e => e);
+          expect(err).toBeInstanceOf(QuoteMismatchError);
+          expect(err.field).toBe("amount");
+          expect(err.source).toBe("quote-ledger");
+          expect(mockClient.createPaymentPayloadCalls).toHaveLength(1);
+        }
+      },
+    );
 
     it("concurrent identical first calls: both may sign — serialization prevents conflicting commitments, not duplicate valid ones", async () => {
       const { client, mockClient } = clientWithExpectation({
